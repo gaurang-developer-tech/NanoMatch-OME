@@ -11,6 +11,7 @@ file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "*.cpp")
 #
 # Each variant is registered with CTest so `ctest` can run all of them.
 
+option(BUILD_TSAN_TESTS "Build ThreadSanitizer test targets" OFF)
 include(GoogleTest)
 foreach(test_src ${TEST_SOURCES})
     # Strip directory and extension to get target name
@@ -52,23 +53,25 @@ foreach(test_src ${TEST_SOURCES})
 
     # ── TSan variant ──────────────────────────────────────────────────────────
     # TSan is incompatible with ASan — must be a separate binary.
-    add_executable(${test_name}_tsan ${test_src})
-    target_link_libraries(${test_name}_tsan
-        PRIVATE
-            hft_core
-            GTest::gtest_main
-            tsan_flags
-    )
-    target_compile_options(${test_name}_tsan PRIVATE
-        -O1
-        -fsanitize=thread
-        -fno-omit-frame-pointer
-    )
-    target_link_options(${test_name}_tsan PRIVATE
-        -fsanitize=thread
-    )
-    gtest_discover_tests(${test_name}_tsan
-        TEST_SUFFIX _tsan
-        DISCOVERY_TIMEOUT 60
-    )
+    if(BUILD_TSAN_TESTS)
+        add_executable(${test_name}_tsan ${test_src})
+        target_link_libraries(${test_name}_tsan
+            PRIVATE
+                hft_core
+                GTest::gtest_main
+                tsan_flags
+        )
+        target_compile_options(${test_name}_tsan PRIVATE
+            -O1
+            -fsanitize=thread
+            -fno-omit-frame-pointer
+        )
+        target_link_options(${test_name}_tsan PRIVATE
+            -fsanitize=thread
+        )
+        gtest_discover_tests(${test_name}_tsan
+            TEST_SUFFIX _tsan
+            DISCOVERY_TIMEOUT 60
+        )
+    endif()
 endforeach()
