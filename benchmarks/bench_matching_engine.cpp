@@ -174,10 +174,10 @@ BENCHMARK_DEFINE_F(MEFixture, LimitOrder_Rest)(benchmark::State& state) {
         engine_->submit(msg);
         benchmark::ClobberMemory();
 
-        // Drain and re-cycle so the book doesn't grow unboundedly.
+        // Drain and re-cycle so the book doesn't grow unboundedly and order is released back to pool.
         state.PauseTiming();
-        auto* book = engine_->book_for(kInst);
-        if (book) book->cancel_order(next_id_ - 1);
+        engine_->submit(cancel_msg(next_id_ - 1));
+        drain_outbound();
         state.ResumeTiming();
     }
     state.SetItemsProcessed(state.iterations());

@@ -62,6 +62,12 @@ protected:
     // ── Order builder helpers ──────────────────────────────────────────────────
     Order* make_bid(Price price, Quantity qty = 100) noexcept {
         Order* o        = pool_.acquire();
+        if (__builtin_expect(o == nullptr, 0)) {
+            pool_.reset();
+            book_->clear();
+            o = pool_.acquire();
+            if (o == nullptr) return nullptr;
+        }
         o->order_id     = next_id_++;
         o->price        = price;
         o->quantity     = qty;
@@ -77,6 +83,12 @@ protected:
 
     Order* make_ask(Price price, Quantity qty = 100) noexcept {
         Order* o        = pool_.acquire();
+        if (__builtin_expect(o == nullptr, 0)) {
+            pool_.reset();
+            book_->clear();
+            o = pool_.acquire();
+            if (o == nullptr) return nullptr;
+        }
         o->order_id     = next_id_++;
         o->price        = price;
         o->quantity     = qty;
@@ -104,6 +116,12 @@ protected:
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, AddOrder_SameLevel)(benchmark::State& state) {
     for (auto _ : state) {
+        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+            state.PauseTiming();
+            pool_.reset();
+            book_->clear();
+            state.ResumeTiming();
+        }
         Order* o = make_bid(kMidBid);
         benchmark::DoNotOptimize(o);
         book_->add_order(o);
@@ -129,6 +147,12 @@ BENCHMARK_DEFINE_F(LOBFixture, AddOrder_NewBest)(benchmark::State& state) {
     Price p = kMidBid + 1;
 
     for (auto _ : state) {
+        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+            state.PauseTiming();
+            pool_.reset();
+            book_->clear();
+            state.ResumeTiming();
+        }
         Order* o = make_bid(p);
         benchmark::DoNotOptimize(o);
         book_->add_order(o);
@@ -156,6 +180,12 @@ BENCHMARK_DEFINE_F(LOBFixture, AddOrder_SpreadOrders)(benchmark::State& state) {
     int64_t       idx     = 0;
 
     for (auto _ : state) {
+        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+            state.PauseTiming();
+            pool_.reset();
+            book_->clear();
+            state.ResumeTiming();
+        }
         const Price p = kMidBid + (idx % kLevels);
         Order* o = make_bid(p);
         benchmark::DoNotOptimize(o);
@@ -474,6 +504,19 @@ BENCHMARK_DEFINE_F(LOBFixture, InterleavedMix)(benchmark::State& state) {
     };
 
     for (auto _ : state) {
+        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+            state.PauseTiming();
+            live_orders.clear();
+            pool_.reset();
+            book_->clear();
+            for (int i = 0; i < 256; ++i) {
+                Price p = kMidBid - (i % 50);
+                Order* o = make_bid(p);
+                book_->add_order(o);
+                live_orders.push_back(o);
+            }
+            state.ResumeTiming();
+        }
         const uint64_t r = next_rand();
 
         if ((r & 0xFF) < 179) {  // ~70% add

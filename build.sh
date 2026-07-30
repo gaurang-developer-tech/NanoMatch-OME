@@ -98,7 +98,7 @@ if $RUN_BENCH; then
         [[ -x "$bench" ]] || continue
         echo ""
         info ">>> $(basename "$bench")"
-        "$bench" --benchmark_min_time=1
+        "$bench" --benchmark_min_time=1s
     done
 else
     info "Running tests (suffix='${SUFFIX}')..."

@@ -115,6 +115,15 @@ public:
         ++free_count_;
     }
 
+    // ── reset() ───────────────────────────────────────────────────────────────
+    //
+    // Reset all order slots back to the freelist. O(Capacity), zero heap allocation.
+    // Useful for resetting benchmarks or clearing state between trading sessions.
+    //
+    void reset() noexcept {
+        build_freelist();
+    }
+
     // ── Diagnostics ───────────────────────────────────────────────────────────
 
     [[nodiscard]] std::size_t capacity()   const noexcept { return Capacity;    }

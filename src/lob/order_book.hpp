@@ -80,6 +80,7 @@ static_assert(sizeof(PriceLevel) == 32,
 // Append `o` to the tail of `lvl`'s intrusive queue.  O(1).
 // The order's prev / next pointers are set; the level counters are updated.
 inline void level_enqueue_tail(PriceLevel& lvl, Order* o) noexcept {
+    if (__builtin_expect(o == nullptr, 0)) return;
     assert(o != nullptr);
     o->next = nullptr;
     o->prev = lvl.tail;
@@ -110,8 +111,10 @@ inline void level_enqueue_tail(PriceLevel& lvl, Order* o) noexcept {
 
     assert(lvl.total_qty  >= o->quantity);
     assert(lvl.order_count >= 1);
-    lvl.total_qty   -= o->quantity;
-    lvl.order_count -= 1;
+    if (lvl.total_qty >= o->quantity) lvl.total_qty -= o->quantity;
+    else lvl.total_qty = 0;
+    if (lvl.order_count >= 1) lvl.order_count -= 1;
+    else lvl.order_count = 0;
 
     o->next = nullptr;
     o->prev = nullptr;
@@ -121,6 +124,7 @@ inline void level_enqueue_tail(PriceLevel& lvl, Order* o) noexcept {
 // Splice `o` out of `lvl`'s intrusive queue without searching.  O(1).
 // Relies on o->prev and o->next being maintained correctly by the book.
 inline void level_remove(PriceLevel& lvl, Order* o) noexcept {
+    if (__builtin_expect(o == nullptr, 0)) return;
     assert(o != nullptr);
     assert(lvl.order_count >= 1);
     assert(lvl.total_qty   >= o->quantity);
@@ -138,8 +142,10 @@ inline void level_remove(PriceLevel& lvl, Order* o) noexcept {
         lvl.tail = o->prev;   // o was the tail
     }
 
-    lvl.total_qty   -= o->quantity;
-    lvl.order_count -= 1;
+    if (lvl.total_qty >= o->quantity) lvl.total_qty -= o->quantity;
+    else lvl.total_qty = 0;
+    if (lvl.order_count >= 1) lvl.order_count -= 1;
+    else lvl.order_count = 0;
 
     o->next = nullptr;
     o->prev = nullptr;
@@ -147,10 +153,13 @@ inline void level_remove(PriceLevel& lvl, Order* o) noexcept {
 
 // Reduce `o`'s quantity by `delta` and update level aggregate.  O(1).
 inline void level_reduce_qty(PriceLevel& lvl, Order* o, Quantity delta) noexcept {
+    if (__builtin_expect(o == nullptr, 0)) return;
     assert(delta <= o->quantity);
     assert(lvl.total_qty >= delta);
-    o->quantity      -= delta;
-    lvl.total_qty    -= delta;
+    if (o->quantity >= delta) o->quantity -= delta;
+    else o->quantity = 0;
+    if (lvl.total_qty >= delta) lvl.total_qty -= delta;
+    else lvl.total_qty = 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -168,6 +177,7 @@ public:
 
     // Register a newly-resting order.
     void insert(Order* o) {
+        if (__builtin_expect(o == nullptr, 0)) return;
         assert(o != nullptr);
         map_.emplace(o->order_id, o);
     }
@@ -255,6 +265,20 @@ public:
     OrderBook(OrderBook&&)                 = default;
     OrderBook& operator=(OrderBook&&)      = default;
 
+    // ── clear() ───────────────────────────────────────────────────────────────
+    // Reset all price levels and index to an empty state without releasing memory.
+    void clear() noexcept {
+        for (auto& lvl : bid_levels_) {
+            lvl.head = nullptr; lvl.tail = nullptr; lvl.total_qty = 0; lvl.order_count = 0;
+        }
+        for (auto& lvl : ask_levels_) {
+            lvl.head = nullptr; lvl.tail = nullptr; lvl.total_qty = 0; lvl.order_count = 0;
+        }
+        best_bid_idx_ = kNoBest;
+        best_ask_idx_ = kNoBest;
+        order_index_.clear();
+    }
+
     // ── add_order() ───────────────────────────────────────────────────────────
     //
     // Insert a new resting order into the book at its price level.
@@ -266,9 +290,11 @@ public:
     // Complexity: O(1)
     //
     void add_order(Order* o) {
+        if (__builtin_expect(o == nullptr, 0)) return;
         assert(o != nullptr);
         assert(o->is_active());
         assert(is_valid_price(o->price));
+        if (!is_valid_price(o->price)) return;
 
         const std::size_t idx = tick_to_index(o->price);
         PriceLevel& lvl = side_levels(o->side)[idx];
@@ -311,8 +337,10 @@ public:
     // Cancel when the caller already holds the Order pointer.
     //
     void cancel_order(Order* o) {
+        if (__builtin_expect(o == nullptr, 0)) return;
         assert(o != nullptr);
         assert(is_valid_price(o->price));
+        if (!is_valid_price(o->price)) return;
 
         const std::size_t idx = tick_to_index(o->price);
         PriceLevel& lvl = side_levels(o->side)[idx];
@@ -336,8 +364,10 @@ public:
     // Complexity: O(1)
     //
     void reduce_order_qty(Order* o, Quantity new_qty) {
+        if (__builtin_expect(o == nullptr, 0)) return;
         assert(o != nullptr);
         assert(new_qty <= o->quantity);
+        if (!is_valid_price(o->price)) return;
 
         const std::size_t idx = tick_to_index(o->price);
         PriceLevel& lvl = side_levels(o->side)[idx];
@@ -374,10 +404,12 @@ public:
     // Complexity: O(1)
     //
     [[nodiscard]] bool fill_resting_order(Order* rest, Quantity fill_qty) noexcept {
+        if (__builtin_expect(rest == nullptr, 0)) return true;
         assert(rest      != nullptr);
         assert(fill_qty  >  0);
         assert(fill_qty  <= rest->quantity);
 
+        if (!is_valid_price(rest->price)) return true;
         const std::size_t idx = tick_to_index(rest->price);
         PriceLevel& lvl = side_levels(rest->side)[idx];
 
