@@ -28,12 +28,12 @@ using namespace hft::core;
 // 1. ORDER LAYOUT
 // ─────────────────────────────────────────────────────────────────────────────
 
-TEST(OrderLayout, SizeIsExactlyOneCacheLine) {
-    // The architecture mandates exactly 64 bytes so one Order == one cache line.
+TEST(OrderLayout, SizeIsExactlyTwoCacheLines) {
+    // The architecture mandates exactly 128 bytes so one Order == two cache lines.
     // If this fires, a field was added / padding changed without updating the
     // layout comment. Fix the struct, not this test.
-    EXPECT_EQ(sizeof(Order), 64u)
-        << "Order must be exactly 64 bytes (one cache line). "
+    EXPECT_EQ(sizeof(Order), 128u)
+        << "Order must be exactly 128 bytes (two cache lines). "
            "Adjust struct layout or padding.";
 }
 

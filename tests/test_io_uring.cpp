@@ -458,10 +458,12 @@ TEST_F(DecoderTest, BufId_ReturnedAfterPoll) {
 
 TEST_F(DecoderTest, BufId_ReturnedForEachSpan_MultiplePoll) {
     // Push 3 spans with different buf_ids.
+    std::vector<std::vector<uint8_t>> kept_alive;
+    kept_alive.reserve(3);
     for (uint32_t i = 0; i < 3; ++i) {
         auto bytes = make_new_order_bytes(i, 1, 1500, 100, 0, 0);
-        // We need to keep the bytes alive — store them on stack
-        RawByteSpan span{bytes.data(), static_cast<uint32_t>(bytes.size()), i};
+        kept_alive.push_back(std::move(bytes));
+        RawByteSpan span{kept_alive.back().data(), static_cast<uint32_t>(kept_alive.back().size()), i};
         raw_queue_.spin_push(span);
     }
 

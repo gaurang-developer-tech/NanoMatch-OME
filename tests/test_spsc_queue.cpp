@@ -276,7 +276,8 @@ TEST(SPSCStress, OneMillion_NoLoss_NoCorruption) {
         }
     }
 
-    // jthread destructor joins automatically — consumer finishes before we assert.
+    // Explicitly join consumer thread before running assertions
+    consumer.join();
 
     // ── Assertions ────────────────────────────────────────────────────────────
 
@@ -332,7 +333,8 @@ TEST(SPSCStress, OneMillion_XorChecksum) {
         while (!q.try_push(lcg)) { HFT_CPU_PAUSE(); }
     }
 
-    // jthread joins here (destructor)
+    // Explicitly join consumer thread before running assertions
+    consumer.join();
 
     EXPECT_EQ(producer_xor, consumer_xor)
         << "XOR checksum mismatch — at least one element was corrupted!";
@@ -362,6 +364,7 @@ TEST(SPSCSpinAPI, SpinPushSpinPop_TwoThreads) {
         const uint32_t val = q.spin_pop();
         EXPECT_EQ(val, i) << "spin_pop returned wrong value at i=" << i;
     }
+    producer.join();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -410,7 +413,8 @@ TEST(SPSCBatchStress, OneMillion_BatchMode) {
         sent += this_batch;
     }
 
-    // jthread destructor joins consumer
+    // Explicitly join consumer thread before running assertions
+    consumer.join();
 
     EXPECT_EQ(cons_cnt, kItems)
         << "Batch stress: item count mismatch (lost items?)";
