@@ -62,12 +62,7 @@ protected:
     // ── Order builder helpers ──────────────────────────────────────────────────
     Order* make_bid(Price price, Quantity qty = 100) noexcept {
         Order* o        = pool_.acquire();
-        if (__builtin_expect(o == nullptr, 0)) {
-            pool_.reset();
-            book_->clear();
-            o = pool_.acquire();
-            if (o == nullptr) return nullptr;
-        }
+        if (__builtin_expect(o == nullptr, 0)) return nullptr;
         o->order_id     = next_id_++;
         o->price        = price;
         o->quantity     = qty;
@@ -83,12 +78,7 @@ protected:
 
     Order* make_ask(Price price, Quantity qty = 100) noexcept {
         Order* o        = pool_.acquire();
-        if (__builtin_expect(o == nullptr, 0)) {
-            pool_.reset();
-            book_->clear();
-            o = pool_.acquire();
-            if (o == nullptr) return nullptr;
-        }
+        if (__builtin_expect(o == nullptr, 0)) return nullptr;
         o->order_id     = next_id_++;
         o->price        = price;
         o->quantity     = qty;
@@ -109,20 +99,17 @@ protected:
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_AddOrder_SameLevel
-//
-// All orders arrive at one price level — pure intrusive-list tail append.
-// Cursor never moves (level already exists as best bid).
-// Lower bound for add_order: just pointer writes + counter increments.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, AddOrder_SameLevel)(benchmark::State& state) {
     for (auto _ : state) {
-        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+        if (__builtin_expect(pool_.free_count() < 100, 0)) {
             state.PauseTiming();
-            pool_.reset();
             book_->clear();
+            pool_.reset();
             state.ResumeTiming();
         }
         Order* o = make_bid(kMidBid);
+        if (!o) { state.SkipWithError("Pool exhausted"); break; }
         benchmark::DoNotOptimize(o);
         book_->add_order(o);
         benchmark::ClobberMemory();
@@ -136,24 +123,20 @@ BENCHMARK_REGISTER_F(LOBFixture, AddOrder_SameLevel)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_AddOrder_NewBest
-//
-// Each order arrives at a strictly better price than the previous best bid,
-// forcing the best_bid cursor to advance every time.
-// Tests: cursor update + level enqueue.
-// Prices cycle through kMidBid+1 … kMidBid+200 to stay in L1 cache.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, AddOrder_NewBest)(benchmark::State& state) {
     static constexpr Price kRange = 200;  // 200 distinct price levels
     Price p = kMidBid + 1;
 
     for (auto _ : state) {
-        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+        if (__builtin_expect(pool_.free_count() < 100, 0)) {
             state.PauseTiming();
-            pool_.reset();
             book_->clear();
+            pool_.reset();
             state.ResumeTiming();
         }
         Order* o = make_bid(p);
+        if (!o) { state.SkipWithError("Pool exhausted"); break; }
         benchmark::DoNotOptimize(o);
         book_->add_order(o);
         benchmark::ClobberMemory();
@@ -168,26 +151,22 @@ BENCHMARK_REGISTER_F(LOBFixture, AddOrder_NewBest)
     ->MinWarmUpTime(0.5);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BM_LOB_AddOrder_SpreadOrders  (parametrised by number of active price levels)
-//
-// Orders are spread across Arg(0) distinct price levels in round-robin fashion.
-// Tests cache-line pressure: many levels → book data spans multiple cache lines.
-//
-// Run with: 1, 10, 100, 500 levels
+// BM_LOB_AddOrder_SpreadOrders
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, AddOrder_SpreadOrders)(benchmark::State& state) {
     const int64_t kLevels = state.range(0);
     int64_t       idx     = 0;
 
     for (auto _ : state) {
-        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+        if (__builtin_expect(pool_.free_count() < 100, 0)) {
             state.PauseTiming();
-            pool_.reset();
             book_->clear();
+            pool_.reset();
             state.ResumeTiming();
         }
         const Price p = kMidBid + (idx % kLevels);
         Order* o = make_bid(p);
+        if (!o) { state.SkipWithError("Pool exhausted"); break; }
         benchmark::DoNotOptimize(o);
         book_->add_order(o);
         benchmark::ClobberMemory();
@@ -206,9 +185,6 @@ BENCHMARK_REGISTER_F(LOBFixture, AddOrder_SpreadOrders)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_CancelOrder_Head
-//
-// Cancel the head (oldest) order of a queue.  Tests the head-pointer update.
-// Pattern: pre-fill N orders → cancel the head one at a time → refill.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_Head)(benchmark::State& state) {
     constexpr std::size_t kBatch = 512;
@@ -216,8 +192,12 @@ BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_Head)(benchmark::State& state) {
     orders.reserve(kBatch);
 
     auto refill = [&] {
+        orders.clear();
+        book_->clear();
+        pool_.reset();
         for (std::size_t i = 0; i < kBatch; ++i) {
             Order* o = make_bid(kMidBid);
+            if (!o) break;
             book_->add_order(o);
             orders.push_back(o);
         }
@@ -231,17 +211,18 @@ BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_Head)(benchmark::State& state) {
             refill();
             state.ResumeTiming();
         }
+        if (orders.empty()) { state.SkipWithError("Pool exhausted"); break; }
 
-        // Cancel the front (head of queue)
         Order* o = orders.front();
-        orders.erase(orders.begin());   // O(N) vector erase — in PauseTiming? No, but
-                                        // we don't count its time: orders are pre-built.
+        orders.erase(orders.begin());
+        if (!o) { state.SkipWithError("Pool exhausted"); break; }
         benchmark::DoNotOptimize(o);
         book_->cancel_order(o);
         pool_.release(o);
         benchmark::ClobberMemory();
     }
     state.SetItemsProcessed(state.iterations());
+    for (auto* o : orders) { if (o) { book_->cancel_order(o); pool_.release(o); } }
 }
 BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_Head)
     ->Unit(benchmark::kNanosecond)
@@ -249,9 +230,6 @@ BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_Head)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_CancelOrder_Tail
-//
-// Cancel the tail (newest) order.  Tests tail-pointer update.
-// Uses vector::back() for O(1) retrieval.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_Tail)(benchmark::State& state) {
     constexpr std::size_t kBatch = 512;
@@ -259,8 +237,12 @@ BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_Tail)(benchmark::State& state) {
     orders.reserve(kBatch);
 
     auto refill = [&] {
+        orders.clear();
+        book_->clear();
+        pool_.reset();
         for (std::size_t i = 0; i < kBatch; ++i) {
             Order* o = make_bid(kMidBid);
+            if (!o) break;
             book_->add_order(o);
             orders.push_back(o);
         }
@@ -273,15 +255,18 @@ BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_Tail)(benchmark::State& state) {
             refill();
             state.ResumeTiming();
         }
+        if (orders.empty()) { state.SkipWithError("Pool exhausted"); break; }
 
         Order* o = orders.back();
         orders.pop_back();
+        if (!o) { state.SkipWithError("Pool exhausted"); break; }
         benchmark::DoNotOptimize(o);
         book_->cancel_order(o);
         pool_.release(o);
         benchmark::ClobberMemory();
     }
     state.SetItemsProcessed(state.iterations());
+    for (auto* o : orders) { if (o) { book_->cancel_order(o); pool_.release(o); } }
 }
 BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_Tail)
     ->Unit(benchmark::kNanosecond)
@@ -289,77 +274,79 @@ BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_Tail)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_CancelOrder_MidQueue
-//
-// Cancel the middle order of a 3-order queue.
-// Tests the full O(1) prev/next splice-out path.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_MidQueue)(benchmark::State& state) {
-    // Setup: o_head <-> o_mid <-> o_tail
-    Order* o_head = make_bid(kMidBid); book_->add_order(o_head);
-    Order* o_mid  = make_bid(kMidBid); book_->add_order(o_mid);
-    Order* o_tail = make_bid(kMidBid); book_->add_order(o_tail);
+    Order* o_head = make_bid(kMidBid);
+    Order* o_mid  = make_bid(kMidBid);
+    Order* o_tail = make_bid(kMidBid);
+    if (!o_head || !o_mid || !o_tail) {
+        state.SkipWithError("Pool exhausted on setup");
+        return;
+    }
+    book_->add_order(o_head);
+    book_->add_order(o_mid);
+    book_->add_order(o_tail);
 
     for (auto _ : state) {
-        // Timed: cancel middle
+        if (!o_mid) { state.SkipWithError("Pool exhausted"); break; }
         benchmark::DoNotOptimize(o_mid);
         book_->cancel_order(o_mid);
         benchmark::ClobberMemory();
 
-        // Restore mid-queue position (PauseTiming wraps setup)
         state.PauseTiming();
         pool_.release(o_mid);
         o_mid = make_bid(kMidBid);
-        // Re-insert between head and tail by inserting, then swapping the tail
-        // (simplification: re-add at tail — still tests the mid splice-out path
-        // since head and new tail are distinct nodes)
+        if (!o_mid) {
+            state.SkipWithError("Pool exhausted");
+            state.ResumeTiming();
+            break;
+        }
         book_->add_order(o_mid);
         state.ResumeTiming();
     }
     state.SetItemsProcessed(state.iterations());
 
-    // Cleanup
-    book_->cancel_order(o_head); pool_.release(o_head);
-    book_->cancel_order(o_mid);  pool_.release(o_mid);
-    book_->cancel_order(o_tail); pool_.release(o_tail);
+    if (o_head) { book_->cancel_order(o_head); pool_.release(o_head); }
+    if (o_mid)  { book_->cancel_order(o_mid);  pool_.release(o_mid); }
+    if (o_tail) { book_->cancel_order(o_tail); pool_.release(o_tail); }
 }
 BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_MidQueue)
     ->Unit(benchmark::kNanosecond)
     ->MinWarmUpTime(0.5);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BM_LOB_CancelOrder_VaryingDepth  (parametrised)
-//
-// The critical O(1) proof benchmark.
-// Queues at one price level are pre-filled to Arg(0) depth.
-// We cancel the TAIL (index = depth-1) each iteration, then re-add.
-// Expected result: time is FLAT across depths (1, 10, 100, 1000).
-// Any slope would indicate an O(N) bug in the splice-out code.
+// BM_LOB_CancelOrder_VaryingDepth
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_VaryingDepth)(benchmark::State& state) {
     const int64_t kDepth = state.range(0);
     std::vector<Order*> queue;
     queue.reserve(static_cast<std::size_t>(kDepth));
 
-    // Pre-fill to the target depth.
     for (int64_t i = 0; i < kDepth; ++i) {
         Order* o = make_bid(kMidBid);
+        if (!o) { state.SkipWithError("Pool exhausted in setup"); return; }
         book_->add_order(o);
         queue.push_back(o);
     }
 
     for (auto _ : state) {
-        // Cancel tail (position = depth-1 from head)
+        if (queue.empty()) { state.SkipWithError("Queue empty"); break; }
         Order* tail = queue.back();
         queue.pop_back();
+        if (!tail) { state.SkipWithError("Null order in queue"); break; }
 
         benchmark::DoNotOptimize(tail);
         book_->cancel_order(tail);
         pool_.release(tail);
         benchmark::ClobberMemory();
 
-        // Restore: re-add one order at tail
         state.PauseTiming();
         Order* fresh = make_bid(kMidBid);
+        if (!fresh) {
+            state.SkipWithError("Pool exhausted");
+            state.ResumeTiming();
+            break;
+        }
         book_->add_order(fresh);
         queue.push_back(fresh);
         state.ResumeTiming();
@@ -367,6 +354,10 @@ BENCHMARK_DEFINE_F(LOBFixture, CancelOrder_VaryingDepth)(benchmark::State& state
 
     state.SetItemsProcessed(state.iterations());
     state.SetLabel("cancels/sec @ depth=" + std::to_string(kDepth));
+
+    for (auto* o : queue) {
+        if (o) { book_->cancel_order(o); pool_.release(o); }
+    }
 }
 BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_VaryingDepth)
     ->Arg(1)->Arg(10)->Arg(100)->Arg(1000)
@@ -378,15 +369,13 @@ BENCHMARK_REGISTER_F(LOBFixture, CancelOrder_VaryingDepth)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_BestBidQuery
-//
-// Measure the cost of reading the best bid / ask (should be 1–3 cycles:
-// load the cached index, bounds-check, return pointer).
-// Tests with a live book (non-empty) to exercise the real branch.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, BestBidQuery)(benchmark::State& state) {
-    // Populate one bid and one ask so the book is non-trivially live.
-    Order* b = make_bid(kMidBid);  book_->add_order(b);
-    Order* a = make_ask(kMidAsk);  book_->add_order(a);
+    Order* b = make_bid(kMidBid);
+    Order* a = make_ask(kMidAsk);
+    if (!b || !a) { state.SkipWithError("Pool exhausted on setup"); return; }
+    book_->add_order(b);
+    book_->add_order(a);
 
     for (auto _ : state) {
         const PriceLevel* bid = book_->best_bid();
@@ -397,8 +386,8 @@ BENCHMARK_DEFINE_F(LOBFixture, BestBidQuery)(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations());
     state.SetLabel("queries/sec");
 
-    book_->cancel_order(b); pool_.release(b);
-    book_->cancel_order(a); pool_.release(a);
+    if (b) { book_->cancel_order(b); pool_.release(b); }
+    if (a) { book_->cancel_order(a); pool_.release(a); }
 }
 BENCHMARK_REGISTER_F(LOBFixture, BestBidQuery)
     ->Unit(benchmark::kNanosecond)
@@ -410,10 +399,6 @@ BENCHMARK_REGISTER_F(LOBFixture, BestBidQuery)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_TickToIndex
-//
-// Isolated measurement of the price-to-index arithmetic.
-// Should compile to: sub + cdq + idiv (or mul by reciprocal with tick=1).
-// Expected: 1–5 ns (1–4 cycles on a modern out-of-order CPU).
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, TickToIndex)(benchmark::State& state) {
     Price p = kMidBid;
@@ -421,7 +406,6 @@ BENCHMARK_DEFINE_F(LOBFixture, TickToIndex)(benchmark::State& state) {
         benchmark::DoNotOptimize(p);
         std::size_t idx = book_->tick_to_index(p);
         benchmark::DoNotOptimize(idx);
-        // Vary p slightly to prevent constant-folding.
         p = kMidBid + (p - kMidBid + 1) % 200;
     }
     state.SetItemsProcessed(state.iterations());
@@ -436,26 +420,18 @@ BENCHMARK_REGISTER_F(LOBFixture, TickToIndex)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_AvailableQuantity
-//
-// Measures available_quantity_at_or_better() which sums PriceLevel::total_qty
-// across Arg(0) filled price levels.  This is the FOK pre-check.
-//
-// Expected: strictly O(N levels crossed) — tests the sum loop.
-// Run at 1, 5, 20, 100 levels to quantify the per-level cost.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, AvailableQuantity)(benchmark::State& state) {
     const int64_t kLevels = state.range(0);
-
-    // Pre-fill kLevels ask levels starting at kMidAsk.
     std::vector<Order*> asks;
     asks.reserve(static_cast<std::size_t>(kLevels));
     for (int64_t i = 0; i < kLevels; ++i) {
         Order* a = make_ask(kMidAsk + i, 100);
+        if (!a) { state.SkipWithError("Pool exhausted on setup"); return; }
         book_->add_order(a);
         asks.push_back(a);
     }
 
-    // Limit price: crosses all kLevels ask levels.
     const Price limit = kMidAsk + static_cast<Price>(kLevels) - 1;
 
     for (auto _ : state) {
@@ -466,7 +442,7 @@ BENCHMARK_DEFINE_F(LOBFixture, AvailableQuantity)(benchmark::State& state) {
     state.SetItemsProcessed(state.iterations() * static_cast<int64_t>(kLevels));
     state.SetLabel("levels/iter=" + std::to_string(kLevels));
 
-    for (auto* o : asks) { book_->cancel_order(o); pool_.release(o); }
+    for (auto* o : asks) { if (o) { book_->cancel_order(o); pool_.release(o); } }
 }
 BENCHMARK_REGISTER_F(LOBFixture, AvailableQuantity)
     ->Arg(1)->Arg(5)->Arg(20)->Arg(100)
@@ -478,25 +454,25 @@ BENCHMARK_REGISTER_F(LOBFixture, AvailableQuantity)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_LOB_InterleavedMix
-//
-// Simulates a realistic market-making workload:
-//   70% add new order at a random price in a ±50-tick spread
-//   30% cancel a random existing resting order
-//
-// This is the closest synthetic approximation to live traffic.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(LOBFixture, InterleavedMix)(benchmark::State& state) {
-    // Pre-warm with 256 resting bids spread across 50 levels.
     std::vector<Order*> live_orders;
     live_orders.reserve(512);
-    for (int i = 0; i < 256; ++i) {
-        Price p = kMidBid - (i % 50);
-        Order* o = make_bid(p);
-        book_->add_order(o);
-        live_orders.push_back(o);
-    }
 
-    // Simple LCG for deterministic pseudo-random decisions (no stdlib overhead).
+    auto warm = [&] {
+        live_orders.clear();
+        book_->clear();
+        pool_.reset();
+        for (int i = 0; i < 256; ++i) {
+            Price p = kMidBid - (i % 50);
+            Order* o = make_bid(p);
+            if (!o) break;
+            book_->add_order(o);
+            live_orders.push_back(o);
+        }
+    };
+    warm();
+
     uint64_t lcg = 0xDEADBEEFCAFEBABEull;
     auto next_rand = [&]() noexcept -> uint64_t {
         lcg = lcg * 6364136223846793005ULL + 1442695040888963407ULL;
@@ -504,17 +480,9 @@ BENCHMARK_DEFINE_F(LOBFixture, InterleavedMix)(benchmark::State& state) {
     };
 
     for (auto _ : state) {
-        if (__builtin_expect(pool_.free_count() < 10, 0)) {
+        if (__builtin_expect(pool_.free_count() < 100, 0)) {
             state.PauseTiming();
-            live_orders.clear();
-            pool_.reset();
-            book_->clear();
-            for (int i = 0; i < 256; ++i) {
-                Price p = kMidBid - (i % 50);
-                Order* o = make_bid(p);
-                book_->add_order(o);
-                live_orders.push_back(o);
-            }
+            warm();
             state.ResumeTiming();
         }
         const uint64_t r = next_rand();
@@ -522,6 +490,7 @@ BENCHMARK_DEFINE_F(LOBFixture, InterleavedMix)(benchmark::State& state) {
         if ((r & 0xFF) < 179) {  // ~70% add
             Price p = kMidBid - static_cast<Price>((r >> 8) % 50);
             Order* o = make_bid(p);
+            if (!o) { state.SkipWithError("Pool exhausted"); break; }
             benchmark::DoNotOptimize(o);
             book_->add_order(o);
             live_orders.push_back(o);
@@ -530,15 +499,18 @@ BENCHMARK_DEFINE_F(LOBFixture, InterleavedMix)(benchmark::State& state) {
                 std::size_t idx = (r >> 16) % live_orders.size();
                 Order* o = live_orders[idx];
                 live_orders.erase(live_orders.begin() + static_cast<std::ptrdiff_t>(idx));
-                benchmark::DoNotOptimize(o);
-                book_->cancel_order(o);
-                pool_.release(o);
+                if (o) {
+                    benchmark::DoNotOptimize(o);
+                    book_->cancel_order(o);
+                    pool_.release(o);
+                }
             }
         }
         benchmark::ClobberMemory();
     }
     state.SetItemsProcessed(state.iterations());
     state.SetLabel("ops/sec");
+    for (auto* o : live_orders) { if (o) { book_->cancel_order(o); pool_.release(o); } }
 }
 BENCHMARK_REGISTER_F(LOBFixture, InterleavedMix)
     ->Unit(benchmark::kNanosecond)

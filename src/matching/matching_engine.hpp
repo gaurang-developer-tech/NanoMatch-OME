@@ -143,6 +143,17 @@ public:
         return (it != books_.end()) ? &it->second : nullptr;
     }
 
+    // Direct pool and state management — for testing and benchmarking only.
+    [[nodiscard]] DefaultOrderPool& pool() noexcept { return pool_; }
+    [[nodiscard]] const DefaultOrderPool& pool() const noexcept { return pool_; }
+
+    void reset_state() noexcept {
+        pool_.reset();
+        for (auto& [id, book] : books_) {
+            book.clear();
+        }
+    }
+
 private:
 
     // ─────────────────────────────────────────────────────────────────────────

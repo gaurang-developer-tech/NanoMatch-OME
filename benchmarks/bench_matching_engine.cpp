@@ -149,6 +149,17 @@ protected:
         drain_outbound();
         return id;
     }
+
+    bool check_and_recycle_pool(benchmark::State& state, std::size_t required = 100) noexcept {
+        if (__builtin_expect(engine_->pool().free_count() < required, 0)) {
+            engine_->reset_state();
+        }
+        if (engine_->pool().free_count() < required) {
+            state.SkipWithError("Pool exhausted");
+            return false;
+        }
+        return true;
+    }
 };
 
 // =============================================================================
@@ -157,24 +168,24 @@ protected:
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_LimitOrder_Rest
-//
-// Baseline: submit a limit order that does not cross any resting order.
-// Measures: pool.acquire() + order field writes + book.add_order() + OrderIndex
-// This is the lower bound for all matching engine operations.
-// Expected: 20–80 ns
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, LimitOrder_Rest)(benchmark::State& state) {
-    // Pre-populate the ask side so the bid never crosses.
     add_resting_ask(kRestAsk);
 
     for (auto _ : state) {
-        // Bid well below the resting ask — guaranteed no match.
+        if (__builtin_expect(engine_->pool().free_count() < 100, 0)) {
+            state.PauseTiming();
+            engine_->reset_state();
+            add_resting_ask(kRestAsk);
+            state.ResumeTiming();
+        }
+        if (engine_->pool().exhausted()) { state.SkipWithError("Pool exhausted"); break; }
+
         InboundOrderMsg msg = new_limit_bid(kRestBid);
         benchmark::DoNotOptimize(msg);
         engine_->submit(msg);
         benchmark::ClobberMemory();
 
-        // Drain and re-cycle so the book doesn't grow unboundedly and order is released back to pool.
         state.PauseTiming();
         engine_->submit(cancel_msg(next_id_ - 1));
         drain_outbound();
@@ -193,35 +204,19 @@ BENCHMARK_REGISTER_F(MEFixture, LimitOrder_Rest)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_FullMatch_SingleOrder
-//
-// THE key latency benchmark:
-//   Measures the full one-way latency of the matching engine's hot path:
-//
-//     engine.submit(aggressive_bid)
-//       → dispatch()
-//       → handle_new_order()
-//       → build Order from pool (O(1))
-//       → do_sweep<price_check>()
-//       → fill_resting_order() — O(1) pointer write + counter update
-//       → post_report() × 2   — push to outbound SPSC
-//       → (no residual: agg fully filled)
-//
-//   This is the sub-microsecond target path.  Expected: 100–400 ns.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, FullMatch_SingleOrder)(benchmark::State& state) {
     for (auto _ : state) {
-        // Setup: add one resting ask (not in timed region)
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
-        // Timed: aggressive bid — crosses and fully fills the resting ask.
         InboundOrderMsg agg = new_limit_bid(kAggBid, 100);
         benchmark::DoNotOptimize(agg);
         engine_->submit(agg);
         benchmark::ClobberMemory();
 
-        // Drain report queue (not timed — prevents back-pressure).
         state.PauseTiming();
         drain_outbound();
         state.ResumeTiming();
@@ -235,23 +230,18 @@ BENCHMARK_REGISTER_F(MEFixture, FullMatch_SingleOrder)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_FullMatch_ExecutionPriceVerified
-//
-// Same as above but drains and verifies the ExecutionReport in the timed
-// region to confirm the full pipeline (submit → report available to caller).
-// Models the lowest achievable round-trip latency.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, FullMatch_ReportVerified)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
-        // Timed region: submit + drain first report.
         InboundOrderMsg agg = new_limit_bid(kAggBid, 100);
         engine_->submit(agg);
 
         ExecutionReport r{};
-        // The report is already in the queue (synchronous ME).
         bool got = outbound_.try_pop(r);
         benchmark::DoNotOptimize(got);
         benchmark::DoNotOptimize(r);
@@ -272,26 +262,22 @@ BENCHMARK_REGISTER_F(MEFixture, FullMatch_ReportVerified)
 // =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BM_ME_MultiLevelSweep  (parametrised by N = 1, 5, 10, 50)
-//
-// Pre-loads N resting asks at N consecutive price levels.
-// One aggressive bid (at limit = asks[N-1].price) sweeps all N in one call.
-//
-// Measures incremental cost per additional level swept.
-// Expected: linear in N with a very small slope (~50–100 ns per level).
+// BM_ME_MultiLevelSweep
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, MultiLevelSweep)(benchmark::State& state) {
     const int64_t kLevels = state.range(0);
 
     for (auto _ : state) {
         state.PauseTiming();
-        // Pre-load N resting asks at prices kRestAsk, kRestAsk+1, …, kRestAsk+N-1
+        if (!check_and_recycle_pool(state, static_cast<std::size_t>(kLevels) + 100)) {
+            state.ResumeTiming();
+            break;
+        }
         for (int64_t i = 0; i < kLevels; ++i) {
             add_resting_ask(kRestAsk + static_cast<Price>(i), 100);
         }
         state.ResumeTiming();
 
-        // Timed: one aggressive bid that crosses all N levels.
         const Price limit = kRestAsk + static_cast<Price>(kLevels) - 1;
         InboundOrderMsg agg = new_limit_bid(limit, static_cast<Quantity>(kLevels * 100));
         benchmark::DoNotOptimize(agg);
@@ -320,6 +306,7 @@ BENCHMARK_REGISTER_F(MEFixture, MultiLevelSweep)
 BENCHMARK_DEFINE_F(MEFixture, MarketOrder_SingleLevel)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
@@ -341,21 +328,23 @@ BENCHMARK_REGISTER_F(MEFixture, MarketOrder_SingleLevel)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_FOK_Reject
-//
-// FOK with insufficient liquidity — measures the pre-check path.
-// No book modification; tests available_quantity_at_or_better() + reject post.
-// Expected: faster than a full match (no intrusive list writes).
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, FOK_Reject)(benchmark::State& state) {
-    // 50 shares available at kRestAsk; FOK needs 200 → guaranteed reject.
     add_resting_ask(kRestAsk, 50);
 
     for (auto _ : state) {
+        if (__builtin_expect(engine_->pool().free_count() < 100, 0)) {
+            state.PauseTiming();
+            engine_->reset_state();
+            add_resting_ask(kRestAsk, 50);
+            state.ResumeTiming();
+        }
+        if (engine_->pool().exhausted()) { state.SkipWithError("Pool exhausted"); break; }
+
         InboundOrderMsg fok = new_fok_bid(kAggBid, 200);
         benchmark::DoNotOptimize(fok);
         engine_->submit(fok);
 
-        // Drain the reject report (not timed separately).
         ExecutionReport r{};
         bool got = outbound_.try_pop(r);
         benchmark::DoNotOptimize(got);
@@ -370,12 +359,11 @@ BENCHMARK_REGISTER_F(MEFixture, FOK_Reject)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_FOK_Accept
-//
-// FOK with sufficient liquidity — pre-check passes, then full sweep.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, FOK_Accept)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
@@ -397,13 +385,11 @@ BENCHMARK_REGISTER_F(MEFixture, FOK_Accept)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_IOC_PartialFill
-//
-// IOC where only 50 of 100 required shares are available.
-// Tests: match 50 → post 3 reports (fill, partial, cancel_ack).
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, IOC_PartialFill)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 50);
         state.ResumeTiming();
 
@@ -429,14 +415,11 @@ BENCHMARK_REGISTER_F(MEFixture, IOC_PartialFill)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_CancelOrder
-//
-// Measures cancel_order path:
-//   OrderIndex lookup (unordered_map::find) + intrusive splice + CancelAck post.
-// Expected: ~100–300 ns (dominated by unordered_map::find hash computation).
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, CancelOrder)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         OrderId oid = add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
@@ -457,35 +440,15 @@ BENCHMARK_REGISTER_F(MEFixture, CancelOrder)
     ->MinWarmUpTime(0.5);
 
 // =============================================================================
-// 6. BURST THROUGHPUT — amortised ns/match across N concurrent crossings
+// 6. BURST THROUGHPUT
 // =============================================================================
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BM_ME_BurstThroughput  (parametrised by burst size)
-//
-// This is the primary throughput benchmark.
-//
-// Setup  (outside timed region):
-//   • Pre-build N InboundOrderMsg structs for crossing bids.
-//   • Pre-load N resting asks at kRestAsk.
-//
-// Timed region:
-//   • Submit all N crossing bids in a tight loop.
-//   • Each bid fully matches exactly one resting ask → 2 reports.
-//
-// Throughput = N matches / total_time_ns → orders/second
-// Latency    = total_time_ns / N → amortised ns/match
-//
-// Run at N = 100, 1000, 10000 to observe:
-//   • L1 hot (100):   all data in L1 cache → best-case latency
-//   • L2 warm (1000): working set ~100 KB → L2 cache hits
-//   • L3 cold (10000):working set ~800 KB → LLC pressure
+// BM_ME_BurstThroughput
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, BurstThroughput)(benchmark::State& state) {
     const int64_t kBurst = state.range(0);
 
-    // Pre-build the burst of crossing bids (stack-allocated for small bursts,
-    // heap for large — but this is in setup, not the timed region).
     std::vector<InboundOrderMsg> bids;
     bids.reserve(static_cast<std::size_t>(kBurst));
     for (int64_t i = 0; i < kBurst; ++i) {
@@ -493,24 +456,23 @@ BENCHMARK_DEFINE_F(MEFixture, BurstThroughput)(benchmark::State& state) {
     }
 
     for (auto _ : state) {
-        // ── Setup (not timed) ──────────────────────────────────────────────
         state.PauseTiming();
-        // Load N resting asks — one per crossing bid.
+        if (!check_and_recycle_pool(state, static_cast<std::size_t>(kBurst) + 100)) {
+            state.ResumeTiming();
+            break;
+        }
         for (int64_t i = 0; i < kBurst; ++i) {
             add_resting_ask(kRestAsk, 100);
         }
         state.ResumeTiming();
 
-        // ── Timed: burst of N crossings ───────────────────────────────────
         for (int64_t i = 0; i < kBurst; ++i) {
             engine_->submit(bids[static_cast<std::size_t>(i)]);
         }
         benchmark::ClobberMemory();
 
-        // ── Drain (not timed) ─────────────────────────────────────────────
         state.PauseTiming();
         drain_outbound();
-        // Reset bid IDs for the next iteration so they stay unique.
         for (int64_t i = 0; i < kBurst; ++i) {
             bids[static_cast<std::size_t>(i)].order_id = next_id_++;
         }
@@ -533,39 +495,21 @@ BENCHMARK_REGISTER_F(MEFixture, BurstThroughput)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_EndToEnd_LimitMatch
-//
-// The canonical HFT latency benchmark.
-// Measures the COMPLETE one-way latency of the matching engine hot path:
-//
-//     t0 = clock_start
-//     engine.submit(aggressive_bid)   ← all book ops + report push
-//     outbound.try_pop(report)        ← confirm report is available
-//     t1 = clock_end
-//
-//     Latency = t1 - t0
-//
-// This benchmark answers the question: "After a packet arrives and is
-// decoded into an InboundOrderMsg, how long before the execution report
-// is ready to be sent back on the wire?"
-//
-// Target: < 500 ns (p99 in production with CPU pinning + huge pages)
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, EndToEnd_LimitMatch)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
-        // ── Timed: full pipeline ───────────────────────────────────────────
         InboundOrderMsg agg = new_limit_bid(kAggBid, 100);
-        engine_->submit(agg);           // ← hot path start
+        engine_->submit(agg);
 
-        // Consume the first ExecutionReport (confirms pipeline completion).
         ExecutionReport r{};
-        const bool ok = outbound_.try_pop(r);  // ← hot path end
+        const bool ok = outbound_.try_pop(r);
         benchmark::DoNotOptimize(ok);
         benchmark::DoNotOptimize(r);
-        // ─────────────────────────────────────────────────────────────────
 
         state.PauseTiming();
         drain_outbound();
@@ -580,18 +524,14 @@ BENCHMARK_REGISTER_F(MEFixture, EndToEnd_LimitMatch)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_EndToEnd_AllReports
-//
-// Same as above but waits for BOTH ExecutionReports (resting + aggressive)
-// to be available before stopping the clock.
-// This is the true "report flush" latency.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, EndToEnd_AllReports)(benchmark::State& state) {
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, 100)) { state.ResumeTiming(); break; }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
-        // Timed: submit + drain both reports.
         InboundOrderMsg agg = new_limit_bid(kAggBid, 100);
         engine_->submit(agg);
 
@@ -604,7 +544,7 @@ BENCHMARK_DEFINE_F(MEFixture, EndToEnd_AllReports)(benchmark::State& state) {
         benchmark::DoNotOptimize(r2);
 
         state.PauseTiming();
-        drain_outbound();   // clear any remainder
+        drain_outbound();
         state.ResumeTiming();
     }
     state.SetItemsProcessed(state.iterations());
@@ -615,23 +555,22 @@ BENCHMARK_REGISTER_F(MEFixture, EndToEnd_AllReports)
     ->MinWarmUpTime(1.0);
 
 // ─────────────────────────────────────────────────────────────────────────────
-// BM_ME_EndToEnd_Spread (bid+ask live together)
-//
-// Models the steady-state market-making scenario:
-//   • One resting bid at kRestBid (passive market maker on the bid)
-//   • One resting ask at kRestAsk (passive market maker on the ask)
-//   • An aggressive bid arrives at kAggBid, sweeps the ask side
-//   • The resting bid on the other side remains untouched
-//
-// This exercises the cursor management when one side is live while the
-// other is being swept.
+// BM_ME_EndToEnd_Spread
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, EndToEnd_Spread)(benchmark::State& state) {
-    // Permanent resting bid on the other side.
-    add_resting_bid(kRestBid, 1'000'000);  // effectively permanent
+    add_resting_bid(kRestBid, 1'000'000);
 
     for (auto _ : state) {
         state.PauseTiming();
+        if (__builtin_expect(engine_->pool().free_count() < 100, 0)) {
+            engine_->reset_state();
+            add_resting_bid(kRestBid, 1'000'000);
+        }
+        if (engine_->pool().exhausted()) {
+            state.SkipWithError("Pool exhausted");
+            state.ResumeTiming();
+            break;
+        }
         add_resting_ask(kRestAsk, 100);
         state.ResumeTiming();
 
@@ -660,19 +599,16 @@ BENCHMARK_REGISTER_F(MEFixture, EndToEnd_Spread)
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BM_ME_Percentile_1000Samples
-//
-// Runs 1000 back-to-back matches and records each individual latency sample
-// via a histogram counter. Google Benchmark will compute mean and stddev
-// automatically; manual percentiles require a custom reporter in production.
-//
-// This benchmark is intended to be run with --benchmark_repetitions=10
-// to get statistical confidence.
 // ─────────────────────────────────────────────────────────────────────────────
 BENCHMARK_DEFINE_F(MEFixture, Percentile_1000Samples)(benchmark::State& state) {
     constexpr int kSamples = 1000;
 
     for (auto _ : state) {
         state.PauseTiming();
+        if (!check_and_recycle_pool(state, kSamples + 100)) {
+            state.ResumeTiming();
+            break;
+        }
         for (int i = 0; i < kSamples; ++i) {
             add_resting_ask(kRestAsk, 100);
         }
