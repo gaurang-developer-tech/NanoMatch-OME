@@ -215,8 +215,8 @@ TEST(SPSCBatch, BatchPreservesOrder) {
     uint64_t src[N], dst[N]{};
     std::iota(src, src + N, 0u);
 
-    q.try_push_batch(src, N);
-    q.try_pop_batch(dst, N);
+    (void)q.try_push_batch(src, N);
+    (void)q.try_pop_batch(dst, N);
 
     for (std::size_t i = 0; i < N; ++i) {
         EXPECT_EQ(dst[i], i) << "Batch FIFO order violated at index " << i;
