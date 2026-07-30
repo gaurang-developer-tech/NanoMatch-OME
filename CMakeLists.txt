@@ -35,6 +35,7 @@ FetchContent_Declare(
     GIT_TAG        v1.14.0
 )
 
+set(BENCHMARK_ENABLE_WERROR OFF CACHE BOOL "" FORCE)
 FetchContent_Declare(
     googlebenchmark
     GIT_REPOSITORY https://github.com/google/benchmark.git
@@ -70,13 +71,13 @@ target_compile_features(hft_core INTERFACE cxx_std_20)
 # ─── Sanitizer build targets ──────────────────────────────────────────────────
 function(add_sanitizer_target name flags)
     add_library(${name}_flags INTERFACE)
-    target_compile_options(${name}_flags INTERFACE ${flags})
-    target_link_options(${name}_flags INTERFACE ${flags})
+    target_compile_options(${name}_flags INTERFACE ${flags} ${ARGN})
+    target_link_options(${name}_flags INTERFACE ${flags} ${ARGN})
 endfunction()
 
-add_sanitizer_target(asan  "-fsanitize=address,undefined -fno-omit-frame-pointer")
-add_sanitizer_target(tsan  "-fsanitize=thread  -fno-omit-frame-pointer")
-add_sanitizer_target(ubsan "-fsanitize=undefined -fno-omit-frame-pointer")
+add_sanitizer_target(asan  "-fsanitize=address,undefined" "-fno-omit-frame-pointer")
+add_sanitizer_target(tsan  "-fsanitize=thread" "-fno-omit-frame-pointer")
+add_sanitizer_target(ubsan "-fsanitize=undefined" "-fno-omit-frame-pointer")
 
 # ─── Tests ────────────────────────────────────────────────────────────────────
 enable_testing()

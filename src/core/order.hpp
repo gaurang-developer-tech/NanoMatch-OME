@@ -102,8 +102,8 @@ struct alignas(64) Order {
 };
 
 // ─── Compile-Time Layout Assertions ───────────────────────────────────────────
-static_assert(sizeof(Order) == 64,
-    "Order must be exactly 64 bytes (one cache line)");
+static_assert(sizeof(Order) == 128,
+    "Order must be exactly 128 bytes (two cache lines)");
 static_assert(alignof(Order) == 64,
     "Order must be 64-byte aligned to avoid false sharing");
 static_assert(std::is_trivially_destructible_v<Order>,

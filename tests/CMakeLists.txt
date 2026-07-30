@@ -11,6 +11,7 @@ file(GLOB TEST_SOURCES CONFIGURE_DEPENDS "*.cpp")
 #
 # Each variant is registered with CTest so `ctest` can run all of them.
 
+include(GoogleTest)
 foreach(test_src ${TEST_SOURCES})
     # Strip directory and extension to get target name
     get_filename_component(test_name ${test_src} NAME_WE)
@@ -71,5 +72,3 @@ foreach(test_src ${TEST_SOURCES})
         DISCOVERY_TIMEOUT 60
     )
 endforeach()
-
-include(GoogleTest)
